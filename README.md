@@ -38,7 +38,9 @@ A lightweight `docker-compose.yml` is provided for local development.
 
 1. Ensure `.env` is populated.
 2. Start the agent entrypoint (uses env defaults if set). The current agent uses a
-   lead-qualification question flow over LiveKit data messages:
+   lead-qualification question flow over LiveKit data messages. If you set
+   `ELEVENLABS_API_KEY` + `ELEVENLABS_VOICE_ID`, the agent also publishes a
+   base64-encoded `tts_audio` data message with ElevenLabs Turbo audio:
 
    ```bash
    python -m agent.main \
@@ -62,6 +64,18 @@ The current proof-of-concept flow asks for:
 - Contact information
 
 It then responds with a booking prompt when qualified, or a polite handoff message if not.
+
+## TTS data payload format (POC)
+
+The agent publishes JSON data payloads with `type: text` and optionally `type: tts_audio`:
+
+```json
+{"type":"text","text":"Thanks for calling! What service are you looking for today?"}
+```
+
+```json
+{"type":"tts_audio","encoding":"base64","data":"<mp3 bytes>"}
+```
 
 ## Notes
 

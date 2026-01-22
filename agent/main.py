@@ -1,5 +1,7 @@
 import argparse
 import asyncio
+import base64
+import json
 import logging
 import os
 import signal
@@ -7,6 +9,7 @@ from typing import Optional
 
 from livekit import api, rtc
 
+from agent.audio_providers import ElevenLabsConfig, ElevenLabsTTS
 from agent.lead_qualification import LeadQualificationFlow
 from livekit_agent import LiveKitAgent
 
@@ -14,13 +17,29 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-def publish_text(room: rtc.Room, participant_id: str, response: str) -> bool:
+def publish_text(
+    room: rtc.Room,
+    participant_id: str,
+    response: str,
+    tts: Optional[ElevenLabsTTS],
+) -> bool:
     _ = participant_id
     if room.local_participant is None:
         logger.warning("No local participant available to publish responses.")
         return False
     try:
-        room.local_participant.publish_data(response.encode("utf-8"))
+        payload = json.dumps({"type": "text", "text": response}).encode("utf-8")
+        room.local_participant.publish_data(payload)
+        if tts is not None:
+            audio_bytes = tts.synthesize(response)
+            audio_payload = json.dumps(
+                {
+                    "type": "tts_audio",
+                    "encoding": "base64",
+                    "data": base64.b64encode(audio_bytes).decode("utf-8"),
+                }
+            ).encode("utf-8")
+            room.local_participant.publish_data(audio_payload)
     except Exception:  # pylint: disable=broad-except
         logger.exception("Failed to publish response.")
         return False
@@ -48,8 +67,22 @@ async def run_agent(
 
     room = rtc.Room()
     qualification_flow = LeadQualificationFlow()
+    tts = None
+    if os.getenv("ELEVENLABS_API_KEY") and os.getenv("ELEVENLABS_VOICE_ID"):
+        tts = ElevenLabsTTS(
+            ElevenLabsConfig(
+                api_key=os.environ["ELEVENLABS_API_KEY"],
+                voice_id=os.environ["ELEVENLABS_VOICE_ID"],
+                model_id=os.getenv("ELEVENLABS_MODEL_ID", "eleven_turbo_v2"),
+                output_format=os.getenv("ELEVENLABS_OUTPUT_FORMAT", "mp3_44100_128"),
+            )
+        )
+        logger.info("ElevenLabs TTS enabled.")
+    else:
+        logger.info("ElevenLabs TTS disabled; set ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID to enable.")
+
     agent = LiveKitAgent(
-        publish_response=lambda participant_id, response: publish_text(room, participant_id, response)
+        publish_response=lambda participant_id, response: publish_text(room, participant_id, response, tts)
     )
 
     @room.on("participant_connected")
