@@ -37,13 +37,31 @@ A lightweight `docker-compose.yml` is provided for local development.
 ## Run the agent
 
 1. Ensure `.env` is populated.
-2. Start your agent entrypoint (replace with your actual command):
+2. Start the agent entrypoint (uses env defaults if set). The current agent uses a
+   lead-qualification question flow over LiveKit data messages:
 
    ```bash
-   python path/to/your_agent.py
+   python -m agent.main \
+     --url "$LIVEKIT_URL" \
+     --api-key "$LIVEKIT_API_KEY" \
+     --api-secret "$LIVEKIT_API_SECRET" \
+     --room "agent-room" \
+     --identity "agent"
    ```
 
-If your agent uses a different runtime (Node, Go, etc.), run the equivalent command for your project.
+You can also set `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`, `LIVEKIT_ROOM`, and
+`LIVEKIT_IDENTITY` in your environment and omit the flags.
+
+## Lead qualification flow (POC)
+
+The current proof-of-concept flow asks for:
+- Service intent
+- Location
+- Timeline
+- Budget range
+- Contact information
+
+It then responds with a booking prompt when qualified, or a polite handoff message if not.
 
 ## Notes
 

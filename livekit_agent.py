@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -45,11 +45,13 @@ class LiveKitAgent:
         silence_timeout_s: float = 1.0,
         max_response_chars: int = 500,
         response_cooldown_s: float = 0.5,
+        publish_response: Optional[Callable[[str, str], bool]] = None,
     ) -> None:
         self.participants: Dict[str, ParticipantState] = {}
         self.turn_taking = TurnTakingManager(silence_timeout_s)
         self.max_response_chars = max_response_chars
         self.response_cooldown_s = response_cooldown_s
+        self.publish_response = publish_response or self._noop_publish
 
     def _now(self) -> float:
         return time.time()
@@ -81,6 +83,8 @@ class LiveKitAgent:
         state = self._get_state(participant_id)
         now = timestamp or self._now()
         state.last_utterance_ts = now
+        if not state.speaking:
+            state.last_speech_end_ts = now
         state.conversation_context.append(text)
         logger.info(
             "transcript_received",
@@ -115,7 +119,7 @@ class LiveKitAgent:
             extra={"participant_id": participant_id, "response": response},
         )
 
-        if self._publish_response(participant_id, response):
+        if self.publish_response(participant_id, response):
             logger.info(
                 "publish_success",
                 extra={"participant_id": participant_id},
@@ -127,7 +131,8 @@ class LiveKitAgent:
             )
         return response
 
-    def _publish_response(self, participant_id: str, response: str) -> bool:
+    @staticmethod
+    def _noop_publish(participant_id: str, response: str) -> bool:
         _ = participant_id
         _ = response
         return True
