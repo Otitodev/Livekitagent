@@ -6,6 +6,7 @@ import logging
 import os
 import signal
 from typing import Optional
+import binascii
 
 from livekit import api, rtc
 
@@ -114,7 +115,21 @@ def _decode_audio_payload(data: bytes) -> Optional[AudioPayload]:
     if not isinstance(raw, str):
         return None
     mimetype = payload.get("mimetype", "audio/wav")
-    return AudioPayload(base64.b64decode(raw), mimetype)
+    try:
+        audio_bytes = base64.b64decode(raw, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    return AudioPayload(audio_bytes, mimetype)
+
+
+async def _delayed_respond(
+    agent: LiveKitAgent,
+    participant_id: str,
+    response: str,
+    delay_s: float,
+) -> None:
+    await asyncio.sleep(delay_s)
+    agent.maybe_respond(participant_id, response)
 
 
 async def run_agent(
@@ -187,7 +202,15 @@ async def run_agent(
         response = _generate_response(llm, conversation_store, participant_id)
         if response:
             conversation_store.append_assistant(participant_id, response)
-            agent.maybe_respond(participant_id, response)
+            if agent.maybe_respond(participant_id, response) is None:
+                asyncio.create_task(
+                    _delayed_respond(
+                        agent,
+                        participant_id,
+                        response,
+                        agent.turn_taking.silence_timeout_s,
+                    )
+                )
 
     print(f"Connecting to room '{room_name}' as '{identity}'...")
     await room.connect(url, token)
