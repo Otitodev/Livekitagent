@@ -10,19 +10,12 @@ import binascii
 
 from livekit import api, rtc
 
-from agent.audio_providers import DeepgramConfig, DeepgramSTT, ElevenLabsConfig, ElevenLabsTTS
-from agent.conversation import ConversationStore
-from agent.llm_provider import OpenAIConfig, OpenAILLM
+from agent.audio_providers import ElevenLabsConfig, ElevenLabsTTS
+from agent.lead_qualification import LeadQualificationFlow
 from livekit_agent import LiveKitAgent
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-
-class AudioPayload:
-    def __init__(self, audio_bytes: bytes, mimetype: str) -> None:
-        self.audio_bytes = audio_bytes
-        self.mimetype = mimetype
 
 
 def publish_text(
@@ -53,85 +46,6 @@ def publish_text(
         return False
     return True
 
-
-def _build_llm() -> Optional[OpenAILLM]:
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        logger.info("OpenAI LLM disabled; set OPENAI_API_KEY to enable.")
-        return None
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-    logger.info("OpenAI LLM enabled with model %s.", model)
-    return OpenAILLM(OpenAIConfig(api_key=api_key, model=model))
-
-
-def _build_stt() -> Optional[DeepgramSTT]:
-    api_key = os.getenv("DEEPGRAM_API_KEY")
-    if not api_key:
-        logger.info("Deepgram STT disabled; set DEEPGRAM_API_KEY to enable.")
-        return None
-    model = os.getenv("DEEPGRAM_MODEL", "nova-2")
-    language = os.getenv("DEEPGRAM_LANGUAGE", "en")
-    logger.info("Deepgram STT enabled with model %s.", model)
-    return DeepgramSTT(DeepgramConfig(api_key=api_key, model=model, language=language))
-
-
-def _generate_response(
-    llm: Optional[OpenAILLM],
-    store: ConversationStore,
-    participant_id: str,
-) -> Optional[str]:
-    if llm is None:
-        return None
-    messages = store.build_messages(participant_id)
-    if not messages:
-        return None
-    return llm.generate(messages)
-
-
-def _decode_text_payload(data: bytes) -> Optional[str]:
-    try:
-        decoded = data.decode("utf-8")
-    except UnicodeDecodeError:
-        return None
-    try:
-        payload = json.loads(decoded)
-    except json.JSONDecodeError:
-        return decoded
-    if payload.get("type") == "text":
-        return payload.get("text")
-    return None
-
-
-def _decode_audio_payload(data: bytes) -> Optional[AudioPayload]:
-    try:
-        payload = json.loads(data.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return None
-    if payload.get("type") != "audio_chunk":
-        return None
-    if payload.get("encoding") != "base64":
-        return None
-    raw = payload.get("data")
-    if not isinstance(raw, str):
-        return None
-    mimetype = payload.get("mimetype", "audio/wav")
-    try:
-        audio_bytes = base64.b64decode(raw, validate=True)
-    except (binascii.Error, ValueError):
-        return None
-    return AudioPayload(audio_bytes, mimetype)
-
-
-async def _delayed_respond(
-    agent: LiveKitAgent,
-    participant_id: str,
-    response: str,
-    delay_s: float,
-) -> None:
-    await asyncio.sleep(delay_s)
-    agent.maybe_respond(participant_id, response)
-
-
 async def run_agent(
     url: str,
     api_key: str,
@@ -153,9 +67,7 @@ async def run_agent(
     )
 
     room = rtc.Room()
-    conversation_store = ConversationStore()
-    llm = _build_llm()
-    stt = _build_stt()
+    qualification_flow = LeadQualificationFlow()
     tts = None
     if os.getenv("ELEVENLABS_API_KEY") and os.getenv("ELEVENLABS_VOICE_ID"):
         tts = ElevenLabsTTS(
@@ -178,39 +90,25 @@ async def run_agent(
     def on_participant_connected(participant: rtc.RemoteParticipant) -> None:
         print(f"Participant connected: {participant.identity}")
         agent.participant_join(participant.identity)
-        conversation_store.start(participant.identity)
+        qualification_flow.start_session(participant.identity)
 
     @room.on("participant_disconnected")
     def on_participant_disconnected(participant: rtc.RemoteParticipant) -> None:
         print(f"Participant disconnected: {participant.identity}")
         agent.participant_leave(participant.identity)
-        conversation_store.end(participant.identity)
+        qualification_flow.end_session(participant.identity)
 
     @room.on("data_received")
     def on_data_received(data: rtc.DataPacket) -> None:
-        text = _decode_text_payload(data.data)
-        if text is None:
-            audio_request = _decode_audio_payload(data.data)
-            if audio_request and stt is not None:
-                text = stt.transcribe(audio_request.audio_bytes, mimetype=audio_request.mimetype)
-            if text is None:
-                logger.warning("Received unsupported payload.")
-                return
+        try:
+            text = data.data.decode("utf-8")
+        except UnicodeDecodeError:
+            logger.warning("Received non-text data payload.")
+            return
         participant_id = data.participant.identity if data.participant else "unknown"
         agent.handle_transcript(participant_id, text)
-        conversation_store.append_user(participant_id, text)
-        response = _generate_response(llm, conversation_store, participant_id)
-        if response:
-            conversation_store.append_assistant(participant_id, response)
-            if agent.maybe_respond(participant_id, response) is None:
-                asyncio.create_task(
-                    _delayed_respond(
-                        agent,
-                        participant_id,
-                        response,
-                        agent.turn_taking.silence_timeout_s,
-                    )
-                )
+        response = qualification_flow.handle_message(participant_id, text)
+        agent.maybe_respond(participant_id, response)
 
     print(f"Connecting to room '{room_name}' as '{identity}'...")
     await room.connect(url, token)

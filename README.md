@@ -58,8 +58,7 @@ You can also set `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`, `LIVEKI
 
 ## Lead qualification flow (POC)
 
-The current proof-of-concept flow uses an OpenAI LLM (default `gpt-4o-mini`) with a system
-prompt that guides the agent to ask for:
+The current proof-of-concept flow asks for:
 - Service intent
 - Location
 - Timeline
