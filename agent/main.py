@@ -6,6 +6,7 @@ import logging
 import os
 import signal
 from typing import Optional
+import binascii
 
 from livekit import api, rtc
 

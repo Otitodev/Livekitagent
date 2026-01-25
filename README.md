@@ -40,7 +40,9 @@ A lightweight `docker-compose.yml` is provided for local development.
 2. Start the agent entrypoint (uses env defaults if set). The current agent uses a
    lead-qualification question flow over LiveKit data messages. If you set
    `ELEVENLABS_API_KEY` + `ELEVENLABS_VOICE_ID`, the agent also publishes a
-   base64-encoded `tts_audio` data message with ElevenLabs Turbo audio:
+   base64-encoded `tts_audio` data message with ElevenLabs Turbo audio. If you set
+   `DEEPGRAM_API_KEY` and send `audio_chunk` payloads, the agent will transcribe them
+   with Deepgram and pass the text to the LLM:
 
    ```bash
    python -m agent.main \
@@ -75,6 +77,14 @@ The agent publishes JSON data payloads with `type: text` and optionally `type: t
 
 ```json
 {"type":"tts_audio","encoding":"base64","data":"<mp3 bytes>"}
+```
+
+## Audio chunk payload format (POC)
+
+To send audio for transcription, publish a JSON data payload with base64 audio bytes:
+
+```json
+{"type":"audio_chunk","encoding":"base64","mimetype":"audio/wav","data":"<wav bytes>"}
 ```
 
 ## Notes
