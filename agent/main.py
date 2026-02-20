@@ -1,179 +1,169 @@
+"""
+LiveKit Voice Agent - Production Entry Point
+
+Usage:
+    python -m agent.main [options]
+
+Or via environment variables (see .env.example)
+"""
+
+from __future__ import annotations
+
 import argparse
 import asyncio
-import base64
-import json
 import logging
 import os
 import signal
+import sys
 from typing import Optional
-import binascii
 
-from livekit import api, rtc
+import structlog
+from dotenv import load_dotenv
 
-from agent.audio_providers import ElevenLabsConfig, ElevenLabsTTS
-from agent.lead_qualification import LeadQualificationFlow
-from livekit_agent import LiveKitAgent
+from agent.worker import VoiceAgentWorker, WorkerConfig
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Load environment variables from .env file
+load_dotenv()
 
 
-def publish_text(
-    room: rtc.Room,
-    participant_id: str,
-    response: str,
-    tts: Optional[ElevenLabsTTS],
-) -> bool:
-    _ = participant_id
-    if room.local_participant is None:
-        logger.warning("No local participant available to publish responses.")
-        return False
-    try:
-        payload = json.dumps({"type": "text", "text": response}).encode("utf-8")
-        room.local_participant.publish_data(payload)
-        if tts is not None:
-            audio_bytes = tts.synthesize(response)
-            audio_payload = json.dumps(
-                {
-                    "type": "tts_audio",
-                    "encoding": "base64",
-                    "data": base64.b64encode(audio_bytes).decode("utf-8"),
-                }
-            ).encode("utf-8")
-            room.local_participant.publish_data(audio_payload)
-    except Exception:  # pylint: disable=broad-except
-        logger.exception("Failed to publish response.")
-        return False
-    return True
-
-async def run_agent(
-    url: str,
-    api_key: str,
-    api_secret: str,
-    room_name: str,
-    identity: str,
-) -> None:
-    token = (
-        api.AccessToken(api_key, api_secret)
-        .with_identity(identity)
-        .with_name(identity)
-        .with_grants(
-            api.VideoGrants(
-                room_join=True,
-                room=room_name,
-            )
-        )
-        .to_jwt()
+def setup_logging(level: str = "INFO") -> None:
+    """Configure structured logging."""
+    structlog.configure(
+        processors=[
+            structlog.contextvars.merge_contextvars,
+            structlog.processors.add_log_level,
+            structlog.processors.TimeStamper(fmt="iso"),
+            structlog.dev.ConsoleRenderer() if sys.stderr.isatty()
+            else structlog.processors.JSONRenderer(),
+        ],
+        wrapper_class=structlog.make_filtering_bound_logger(
+            getattr(logging, level.upper())
+        ),
+        context_class=dict,
+        logger_factory=structlog.PrintLoggerFactory(),
     )
 
-    room = rtc.Room()
-    qualification_flow = LeadQualificationFlow()
-    tts = None
-    if os.getenv("ELEVENLABS_API_KEY") and os.getenv("ELEVENLABS_VOICE_ID"):
-        tts = ElevenLabsTTS(
-            ElevenLabsConfig(
-                api_key=os.environ["ELEVENLABS_API_KEY"],
-                voice_id=os.environ["ELEVENLABS_VOICE_ID"],
-                model_id=os.getenv("ELEVENLABS_MODEL_ID", "eleven_turbo_v2"),
-                output_format=os.getenv("ELEVENLABS_OUTPUT_FORMAT", "mp3_44100_128"),
-            )
-        )
-        logger.info("ElevenLabs TTS enabled.")
-    else:
-        logger.info("ElevenLabs TTS disabled; set ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID to enable.")
-
-    agent = LiveKitAgent(
-        publish_response=lambda participant_id, response: publish_text(room, participant_id, response, tts)
+    # Also configure standard logging for libraries
+    logging.basicConfig(
+        level=getattr(logging, level.upper()),
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
-
-    @room.on("participant_connected")
-    def on_participant_connected(participant: rtc.RemoteParticipant) -> None:
-        print(f"Participant connected: {participant.identity}")
-        agent.participant_join(participant.identity)
-        qualification_flow.start_session(participant.identity)
-
-    @room.on("participant_disconnected")
-    def on_participant_disconnected(participant: rtc.RemoteParticipant) -> None:
-        print(f"Participant disconnected: {participant.identity}")
-        agent.participant_leave(participant.identity)
-        qualification_flow.end_session(participant.identity)
-
-    @room.on("data_received")
-    def on_data_received(data: rtc.DataPacket) -> None:
-        try:
-            text = data.data.decode("utf-8")
-        except UnicodeDecodeError:
-            logger.warning("Received non-text data payload.")
-            return
-        participant_id = data.participant.identity if data.participant else "unknown"
-        agent.handle_transcript(participant_id, text)
-        response = qualification_flow.handle_message(participant_id, text)
-        agent.maybe_respond(participant_id, response)
-
-    print(f"Connecting to room '{room_name}' as '{identity}'...")
-    await room.connect(url, token)
-    print("Connected. Press Ctrl+C to disconnect.")
-
-    stop_event = asyncio.Event()
-
-    def request_shutdown() -> None:
-        stop_event.set()
-
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, request_shutdown)
-        except NotImplementedError:
-            signal.signal(sig, lambda *_: request_shutdown())
-
-    await stop_event.wait()
-
-    print("Disconnecting...")
-    await room.disconnect()
-    print("Disconnected.")
 
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="LiveKit agent connection CLI")
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="LiveKit Voice Agent",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Environment variables (can also be set in .env file):
+  LIVEKIT_URL          LiveKit server URL
+  LIVEKIT_API_KEY      LiveKit API key
+  LIVEKIT_API_SECRET   LiveKit API secret
+  LIVEKIT_ROOM         Room name to join
+  DEEPGRAM_API_KEY     Deepgram API key for STT
+  OPENAI_API_KEY       OpenAI API key for LLM
+  ELEVENLABS_API_KEY   ElevenLabs API key for TTS
+  ELEVENLABS_VOICE_ID  ElevenLabs voice ID
+  REDIS_URL            Redis connection URL
+        """,
+    )
+
     parser.add_argument(
         "--url",
         default=os.getenv("LIVEKIT_URL"),
-        help="LiveKit server URL (or LIVEKIT_URL env var)",
+        help="LiveKit server URL",
     )
     parser.add_argument(
         "--api-key",
         default=os.getenv("LIVEKIT_API_KEY"),
-        help="LiveKit API key (or LIVEKIT_API_KEY env var)",
+        help="LiveKit API key",
     )
     parser.add_argument(
         "--api-secret",
         default=os.getenv("LIVEKIT_API_SECRET"),
-        help="LiveKit API secret (or LIVEKIT_API_SECRET env var)",
+        help="LiveKit API secret",
     )
     parser.add_argument(
         "--room",
         default=os.getenv("LIVEKIT_ROOM", "agent-room"),
-        help="Room name to join (or LIVEKIT_ROOM env var)",
+        help="Room name to join",
     )
     parser.add_argument(
         "--identity",
         default=os.getenv("LIVEKIT_IDENTITY", "agent"),
-        help="Participant identity (or LIVEKIT_IDENTITY env var)",
+        help="Agent identity",
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--log-level",
+        default=os.getenv("LOG_LEVEL", "INFO"),
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Logging level",
+    )
+
+    args = parser.parse_args(argv)
+
+    # Validate required arguments
+    if not args.url:
+        parser.error("--url or LIVEKIT_URL is required")
+    if not args.api_key:
+        parser.error("--api-key or LIVEKIT_API_KEY is required")
+    if not args.api_secret:
+        parser.error("--api-secret or LIVEKIT_API_SECRET is required")
+
+    return args
+
+
+async def run_worker(config: WorkerConfig) -> None:
+    """Run the voice agent worker with signal handling."""
+    worker = VoiceAgentWorker(config)
+
+    # Set up signal handlers
+    loop = asyncio.get_running_loop()
+
+    def request_shutdown() -> None:
+        asyncio.create_task(worker.stop())
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, request_shutdown)
+        except NotImplementedError:
+            # Windows doesn't support add_signal_handler
+            signal.signal(sig, lambda *_: request_shutdown())
+
+    try:
+        await worker.start()
+        print(f"Agent running in room '{config.room_name}'. Press Ctrl+C to stop.")
+        await worker.run()
+    except Exception as e:
+        logging.error(f"Worker error: {e}")
+        raise
+    finally:
+        await worker.stop()
 
 
 def main() -> None:
+    """Main entry point."""
     args = parse_args()
-    asyncio.run(
-        run_agent(
-            url=args.url,
-            api_key=args.api_key,
-            api_secret=args.api_secret,
-            room_name=args.room,
-            identity=args.identity,
-        )
+    setup_logging(args.log_level)
+
+    config = WorkerConfig(
+        livekit_url=args.url,
+        livekit_api_key=args.api_key,
+        livekit_api_secret=args.api_secret,
+        room_name=args.room,
+        identity=args.identity,
+        deepgram_api_key=os.getenv("DEEPGRAM_API_KEY", ""),
+        deepgram_model=os.getenv("DEEPGRAM_MODEL", "nova-2"),
+        openai_api_key=os.getenv("OPENAI_API_KEY", ""),
+        openai_model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        elevenlabs_api_key=os.getenv("ELEVENLABS_API_KEY", ""),
+        elevenlabs_voice_id=os.getenv("ELEVENLABS_VOICE_ID", ""),
+        elevenlabs_model_id=os.getenv("ELEVENLABS_MODEL_ID", "eleven_turbo_v2"),
+        redis_url=os.getenv("REDIS_URL", "redis://localhost:6379/0"),
     )
+
+    asyncio.run(run_worker(config))
 
 
 if __name__ == "__main__":
